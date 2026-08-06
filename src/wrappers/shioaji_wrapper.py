@@ -12,14 +12,42 @@ class ShioajiWrapper:
     _CONTRACTS_FETCH_TIMEOUT_S = 60
 
     def __init__(self):
-        if ShioajiWrapper._api is None:
-            ShioajiWrapper._api = sj.Shioaji(simulation=False)
-            ShioajiWrapper._api.login(
-                api_key=os.environ.get("SHIOAJI_API_KEY"),
-                secret_key=os.environ.get("SHIOAJI_SECRET_KEY"),
-                contracts_timeout=ShioajiWrapper._CONTRACTS_FETCH_TIMEOUT_S * 1000,
-            )
+        # No login here. get_order_book / get_futures_ticks serve an already
+        # cached parquet without touching the API, so constructing a wrapper
+        # must not require credentials or a network round trip; the client is
+        # built by the first call that actually needs one (see _ensure_api).
         ShioajiWrapper._ref_count += 1
+
+    @classmethod
+    def _ensure_api(cls):
+        """Build and log in the shared client, once, on first real use."""
+        if cls._api is not None:
+            return cls._api
+
+        # simulation=True: the flag only swaps the order/portfolio plane for
+        # api/v1/paper/*. Market data -- ticks, kbars, snapshots, contracts --
+        # hits the same endpoints either way, and our key is provisioned
+        # paper-only, so a production login is rejected outright with
+        # "Token doesn't have production permission". NB: were this wrapper
+        # ever to place real orders, they would route to the paper endpoint.
+        api = sj.Shioaji(simulation=True)
+        api.login(
+            api_key=os.environ.get("SHIOAJI_API_KEY"),
+            secret_key=os.environ.get("SHIOAJI_SECRET_KEY"),
+            # login() takes milliseconds; block until the contract file
+            # is downloaded instead of returning immediately (default 0).
+            contracts_timeout=cls._CONTRACTS_FETCH_TIMEOUT_S * 1000,
+        )
+        # Publish only once login has returned. Binding a never-logged-in
+        # client here would make every later call skip login and reuse a dead
+        # handle, turning one clear auth error into a 60s hang elsewhere.
+        cls._api = api
+        return cls._api
+
+    @property
+    def api(self):
+        """The logged-in Shioaji client, logging in on first access."""
+        return ShioajiWrapper._ensure_api()
 
     def __del__(self):
         ShioajiWrapper._ref_count -= 1
@@ -38,9 +66,11 @@ class ShioajiWrapper:
         with it still incomplete (it does not raise on timeout), and iterating
         or indexing Contracts before then sees a partial/empty set. Poll
         Contracts.status until Fetched; raise if it never completes.
+
+        Every method that needs the network funnels through here, so this is
+        also where the lazy login happens.
         """
-        if ShioajiWrapper._api is None:
-            raise RuntimeError("Shioaji API is not initialized.")
+        ShioajiWrapper._ensure_api()
         deadline = time.monotonic() + ShioajiWrapper._CONTRACTS_FETCH_TIMEOUT_S
         while ShioajiWrapper._api.Contracts.status != sj.FetchStatus.Fetched:
             if time.monotonic() >= deadline:
