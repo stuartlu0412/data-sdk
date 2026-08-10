@@ -115,6 +115,12 @@ df_contracts = shioaji.get_futures_contracts()  # currently-listed contracts onl
 tej = TEJWrapper()
 df_rev = tej.get_ewsale()                        # from 2021-01-01 (subscription floor)
 df_rev = tej.get_ewsale(min_date="2023-01-01")   # custom start for a cold fetch
+# Warm calls re-fetch the trailing 60 days (EWSALE_REFETCH_DAYS) and merge: TEJ
+# keeps adding rows for an announcement date days after the fact, so a
+# strictly-newer cursor loses them. refetch_since widens that window for a
+# one-off repair -- EWSALE_MIN_DATE rebuilds the whole table as a union-merge
+# (~157k rows, ~31% of the 500k/day row quota; not for a daily job).
+df_rev = tej.get_ewsale(refetch_since=TEJWrapper.EWSALE_MIN_DATE)
 
 # Fetch Taiwan warrant metadata (cached to disk, requires FINMIND_API_TOKEN)
 warrant_info = WarrantInfoWrapper(cache_dir=Path("/tmp/warrant_cache"))
