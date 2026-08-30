@@ -4,10 +4,60 @@ import sys
 import pandas as pd
 from FinMind.data import DataLoader
 
+from .finmind_rate_limit import FinMindRateLimiter, batch_size
+
+# Column order of the archive; a window is read as one multi-file scan, so a
+# written day must not reshuffle it.
+BROKER_COLUMNS = [
+    "securities_trader",
+    "price",
+    "buy",
+    "sell",
+    "securities_trader_id",
+    "stock_id",
+    "date",
+]
+
+# Every stock that did not come back is checked individually (a check costs
+# the same one request as a fetch). Exception: when most of the universe is
+# missing, a small sample decides and the result is flagged inferred.
+PROBE_SAMPLE = 8
+THIN_FRACTION = 0.4
+
+# Guards against certifying a day against a truncated universe.
+MIN_EXPECTED = 1200
+
+_INDEX_INDUSTRIES = {"大盤", "Index", "所有證券"}
+_INDEX_IDS = {"TAIEX", "TPEx"}
+
+
+class BrokerFetchResult:
+    """Outcome of fetching a set of ``(stock_id, day)`` cells.
+
+    ``absent``: shown empty upstream. ``unresolved``: returned nothing but not
+    shown empty (likely dropped). ``inferred``: absence concluded from a
+    sample rather than per stock.
+    """
+
+    def __init__(self, frame, received, absent, unresolved, requests_spent,
+                 inferred=False):
+        self.frame = frame
+        self.received = received
+        self.absent = absent
+        self.unresolved = unresolved
+        self.requests_spent = requests_spent
+        self.inferred = inferred
+
+    @property
+    def complete(self):
+        return not self.unresolved and not self.inferred
+
 
 class FinMindWrapper:
     _api = None
     _ref_count = 0
+    _limiter = None
+    _stock_info = None
 
     def __init__(self):
         if FinMindWrapper._api is None:
@@ -93,6 +143,142 @@ class FinMindWrapper:
         consumers never reach the underlying DataLoader directly. Returns the
         DataLoader's DataFrame (a ``date`` column of ``YYYY-MM-DD`` strings).
         """
+        self.limiter().acquire(1)
         return FinMindWrapper._api.taiwan_stock_trading_date(
             start_date=start_date, end_date=end_date
         )
+
+    # ------------------------------------------------------------------
+    # Fetch surface -- used by the scheduled writer and the archive repair.
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def limiter(cls):
+        if cls._limiter is None:
+            ledger = os.environ.get("DATA_SDK_FINMIND_RATE_LEDGER") or os.path.join(
+                cls.broker_dir(), ".finmind_rate_ledger.json"
+            )
+            cls._limiter = FinMindRateLimiter(ledger, capacity=cls._account_limit())
+        return cls._limiter
+
+    @classmethod
+    def _account_limit(cls):
+        """The account's hourly quota, or None when it cannot be read.
+
+        ``api_usage`` is not a trustworthy live counter, so only the ceiling is
+        taken from here; pacing comes from the local ledger.
+        """
+        try:
+            return int(FinMindWrapper._api.api_request_limit)
+        except Exception:
+            return None
+
+    def get_traded_stock_ids(self, day):
+        """Stock ids that actually traded on ``day``.
+
+        One request. Uses FinMind's sync branch, which raises on a quota
+        rejection instead of returning a short (falsely complete) universe.
+        """
+        self.limiter().acquire(1)
+        prices = FinMindWrapper._api.taiwan_stock_daily(
+            start_date=day, end_date=day
+        )
+        if prices is None or prices.empty:
+            return set()
+        traded = set(
+            prices[prices["Trading_Volume"] > 0]["stock_id"].astype(str)
+        )
+        return traded & self._listed_stock_ids()
+
+    def _listed_stock_ids(self):
+        """Real twse/tpex equities, memoised for the process."""
+        if FinMindWrapper._stock_info is None:
+            self.limiter().acquire(1)
+            info = FinMindWrapper._api.taiwan_stock_info()
+            listed = info[
+                info["type"].isin(["twse", "tpex"])
+                & ~info["industry_category"].isin(_INDEX_INDUSTRIES)
+                & ~info["stock_id"].isin(_INDEX_IDS)
+            ]
+            FinMindWrapper._stock_info = set(listed["stock_id"].astype(str))
+        return FinMindWrapper._stock_info
+
+    def fetch_broker_cells(self, day, stock_ids, verify=True, universe_size=0):
+        """Fetch exactly these ``(stock_id, day)`` cells.
+
+        FinMind's batch path is asynchronous and discards failed responses,
+        so anything not returned is re-checked on the single-stock sync path,
+        which raises on a quota rejection. ``universe_size`` (the day's
+        traded-stock count) only serves to recognise a nearly-empty date.
+        """
+        wanted = [str(s) for s in stock_ids]
+        if not wanted:
+            return BrokerFetchResult(self._empty_frame(), set(), set(), set(), 0)
+
+        limiter = self.limiter()
+        # A batch is reserved in one go, so it can never exceed an hour's worth.
+        chunk = max(1, min(batch_size(), limiter.capacity))
+        frames = []
+        spent = 0
+        for start in range(0, len(wanted), chunk):
+            batch = wanted[start : start + chunk]
+            limiter.acquire(len(batch))
+            spent += len(batch)
+            frame = FinMindWrapper._api.taiwan_stock_trading_daily_report(
+                date=day, stock_id_list=batch
+            )
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+
+        merged = (
+            pd.concat(frames, ignore_index=True) if frames else self._empty_frame()
+        )
+        received = (
+            set(merged["stock_id"].astype(str)) if not merged.empty else set()
+        )
+        missing = [s for s in wanted if s not in received]
+        if not missing or not verify:
+            return BrokerFetchResult(
+                merged, received, set(), set(missing), spent
+            )
+
+        absent, unresolved, probe_cost, inferred = self._classify_missing(
+            day, missing, universe_size
+        )
+        return BrokerFetchResult(
+            merged, received, absent, unresolved, spent + probe_cost, inferred
+        )
+
+    def _classify_missing(self, day, missing, universe_size=0):
+        """Split ids that returned nothing into empty-upstream and lost."""
+        if universe_size and len(missing) > universe_size * THIN_FRACTION:
+            # Most of the market absent: sample rather than walk it.
+            ordered = sorted(missing)
+            stride = max(1, len(ordered) // PROBE_SAMPLE)
+            spent = 0
+            for sid in ordered[::stride][:PROBE_SAMPLE]:
+                rows, cost = self._probe(day, sid)
+                spent += cost
+                if rows:
+                    # Upstream has data we did not receive: the batch lost rows.
+                    return set(), set(missing), spent, False
+            return set(missing), set(), spent, True
+
+        absent, unresolved, spent = set(), set(), 0
+        for sid in missing:
+            rows, cost = self._probe(day, sid)
+            spent += cost
+            (absent if rows == 0 else unresolved).add(sid)
+        return absent, unresolved, spent, False
+
+    def _probe(self, day, sid):
+        """Single-stock sync request: raises on quota, returns a row count."""
+        self.limiter().acquire(1)
+        frame = FinMindWrapper._api.taiwan_stock_trading_daily_report(
+            date=day, stock_id=str(sid)
+        )
+        return (0 if frame is None or frame.empty else len(frame)), 1
+
+    @staticmethod
+    def _empty_frame():
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in BROKER_COLUMNS})
