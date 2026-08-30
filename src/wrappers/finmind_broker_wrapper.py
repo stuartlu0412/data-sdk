@@ -40,6 +40,17 @@ class FinMindWrapper:
         except Exception as e:
             raise RuntimeError(f"Download failed for {day}: {e}")
 
+    def get_trading_dates(self, start_date, end_date):
+        """Taiwan trading calendar between the two dates, inclusive.
+
+        Thin accessor over FinMind's ``taiwan_stock_trading_date`` dataset so
+        consumers never reach the underlying DataLoader directly. Returns the
+        DataLoader's DataFrame (a ``date`` column of ``YYYY-MM-DD`` strings).
+        """
+        return FinMindWrapper._api.taiwan_stock_trading_date(
+            start_date=start_date, end_date=end_date
+        )
+
     def get_broker(self, day, sid):
         """Read broker data for (day, sid). Downloads if missing."""
         output_dir = os.environ.get("DATA_SDK_FINMIND_BROKER_PATH", ".")
