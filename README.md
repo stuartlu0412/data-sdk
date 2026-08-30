@@ -77,6 +77,16 @@ export SHIOAJI_SECRET_KEY=your_secret_key
 export TEJ_API_TOKEN=your_tej_token
 ```
 
+### FinMind Rate Limiting
+FinMind answers HTTP 402 once the hourly quota is gone, and its async client
+drops the failed requests silently. Every FinMind caller draws from one token
+bucket in a flock-guarded ledger, so separate processes share one budget.
+
+```bash
+export DATA_SDK_FINMIND_RATE_LIMIT=6000   # hourly quota; defaults to the account limit, else 600
+export DATA_SDK_FINMIND_RATE_MARGIN=0.7   # fraction of the quota actually used
+```
+
 ## Usage
 
 ### Wrappers
