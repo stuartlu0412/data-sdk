@@ -1,7 +1,10 @@
 import os
 import sys
+import tempfile
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from FinMind.data import DataLoader
 
 from .finmind_rate_limit import FinMindRateLimiter, batch_size
@@ -282,3 +285,50 @@ class FinMindWrapper:
     @staticmethod
     def _empty_frame():
         return pd.DataFrame({c: pd.Series(dtype="object") for c in BROKER_COLUMNS})
+
+    # ------------------------------------------------------------------
+    # Write surface -- the only writer of the archive.
+    # ------------------------------------------------------------------
+
+    def write_broker_day(self, day, df, output_dir=None):
+        """Deduplicate and atomically publish one day of broker rows.
+
+        Upstream can serve duplicated rows; a net position sums buy - sell
+        per branch, so duplicates are dropped once here, not by every reader.
+        """
+        output_dir = output_dir or self.broker_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"{day}.parquet")
+
+        frame = df.copy()
+        for column in BROKER_COLUMNS:
+            if column not in frame.columns:
+                raise ValueError(f"broker frame for {day} is missing column {column}")
+        frame = frame[BROKER_COLUMNS]
+        frame["stock_id"] = frame["stock_id"].astype(str)
+        frame = frame.drop_duplicates().reset_index(drop=True)
+
+        table = pa.Table.from_pandas(frame, preserve_index=False)
+        # Pin the text columns so every written day keeps one schema.
+        table = table.cast(
+            pa.schema(
+                [
+                    pa.field(f.name, pa.large_string())
+                    if pa.types.is_string(f.type) or pa.types.is_large_string(f.type)
+                    else f
+                    for f in table.schema
+                ]
+            )
+        )
+
+        fd, tmp_path = tempfile.mkstemp(dir=output_dir, prefix=".broker-", suffix=".tmp")
+        os.close(fd)
+        try:
+            pq.write_table(table, tmp_path)
+            # mkstemp creates 0600, which os.replace would keep.
+            os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        return path
