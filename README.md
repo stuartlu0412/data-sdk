@@ -77,6 +77,16 @@ export SHIOAJI_SECRET_KEY=your_secret_key
 export TEJ_API_TOKEN=your_tej_token
 ```
 
+### FinMind Rate Limiting
+FinMind answers HTTP 402 once the hourly quota is gone, and its async client
+drops the failed requests silently. Every FinMind caller draws from one token
+bucket in a flock-guarded ledger, so separate processes share one budget.
+
+```bash
+export DATA_SDK_FINMIND_RATE_LIMIT=6000   # hourly quota; defaults to the account limit, else 600
+export DATA_SDK_FINMIND_RATE_MARGIN=0.7   # fraction of the quota actually used
+```
+
 ## Usage
 
 ### Wrappers
@@ -95,9 +105,19 @@ from data_sdk import (
 )
 from pathlib import Path
 
-# Get FinMind broker data (downloads if missing)
+# Read FinMind broker data. Reads never download: the archive is filled by a
+# scheduled writer, and a missing day raises FileNotFoundError.
 finmind = FinMindWrapper()
 df = finmind.get_broker("2024-01-02", "2330")
+day = finmind.get_broker_day("2024-01-02", sids=["2330", "2317"])
+
+# Filling the archive (scheduled writer only): fetch exactly the missing
+# stocks, re-check anything the batch dropped, then dedup + atomic write.
+expected = finmind.get_traded_stock_ids("2024-01-02")
+missing = expected - finmind.archived_stock_ids("2024-01-02")
+result = finmind.fetch_broker_cells("2024-01-02", missing)
+if result.complete:
+    finmind.write_broker_day("2024-01-02", result.frame)
 
 # Get Shioaji order book data (downloads if missing)
 shioaji = ShioajiWrapper()
