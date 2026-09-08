@@ -39,6 +39,7 @@ def get_order_book_stocks(
     is_twse: bool,
     sid: Optional[str] = None,
     lazy: bool = False,
+    format_match_time: bool = True,
 ) -> Union[pd.DataFrame, pl.LazyFrame]:
     """Load order book (regular lots) from parquet for a given day, optionally filtered by stock.
 
@@ -50,9 +51,14 @@ def get_order_book_stocks(
         is_twse: True for TWSE, False for OTC.
         sid: Stock code. If None, returns the entire day for all stocks.
         lazy: If True, return a polars LazyFrame; otherwise collect and return pandas DataFrame.
+        format_match_time: If True, rewrite match_time to "HH:MM:SS.ffffff". Pass False to
+            keep the on-disk Int64 (HHMMSSffffff), which a filter can push down to the
+            parquet row-group statistics; the formatted column is computed, so a predicate
+            on it forces a full scan.
 
     Returns:
-        pandas DataFrame or polars LazyFrame with match_time formatted as HH:MM:SS.mmm.
+        pandas DataFrame or polars LazyFrame. match_time is formatted as HH:MM:SS.ffffff
+        unless format_match_time is False, in which case it stays the raw Int64.
     """
     base = _order_book_base_path()
     day_plain = day.replace("-", "")
@@ -62,7 +68,8 @@ def get_order_book_stocks(
     df_lazy = pl.scan_parquet(str(path))
     if sid is not None:
         df_lazy = df_lazy.filter(pl.col("stock_code") == sid)
-    df_lazy = _format_match_time(df_lazy)
+    if format_match_time:
+        df_lazy = _format_match_time(df_lazy)
 
     if lazy:
         return df_lazy
@@ -74,6 +81,7 @@ def get_order_book_odd_lots(
     is_twse: bool,
     sid: Optional[str] = None,
     lazy: bool = False,
+    format_match_time: bool = True,
 ) -> Union[pd.DataFrame, pl.LazyFrame]:
     """Load order book (odd lots) from parquet for a given day, optionally filtered by stock.
 
@@ -85,9 +93,14 @@ def get_order_book_odd_lots(
         is_twse: True for TWSE, False for OTC.
         sid: Stock code. If None, returns the entire day for all stocks.
         lazy: If True, return a polars LazyFrame; otherwise collect and return pandas DataFrame.
+        format_match_time: If True, rewrite match_time to "HH:MM:SS.ffffff". Pass False to
+            keep the on-disk Int64 (HHMMSSffffff), which a filter can push down to the
+            parquet row-group statistics; the formatted column is computed, so a predicate
+            on it forces a full scan.
 
     Returns:
-        pandas DataFrame or polars LazyFrame with match_time formatted as HH:MM:SS.mmm.
+        pandas DataFrame or polars LazyFrame. match_time is formatted as HH:MM:SS.ffffff
+        unless format_match_time is False, in which case it stays the raw Int64.
     """
     base = _order_book_base_path()
     day_plain = day.replace("-", "")
@@ -97,7 +110,8 @@ def get_order_book_odd_lots(
     df_lazy = pl.scan_parquet(str(path))
     if sid is not None:
         df_lazy = df_lazy.filter(pl.col("stock_code") == sid)
-    df_lazy = _format_match_time(df_lazy)
+    if format_match_time:
+        df_lazy = _format_match_time(df_lazy)
 
     if lazy:
         return df_lazy
@@ -109,6 +123,7 @@ def get_order_book_warrant(
     is_twse: bool,
     sid: Optional[str] = None,
     lazy: bool = False,
+    format_match_time: bool = True,
 ) -> Union[pd.DataFrame, pl.LazyFrame]:
     """Load order book (warrant) from parquet for a given day, optionally filtered by warrant code.
 
@@ -120,9 +135,14 @@ def get_order_book_warrant(
         is_twse: True for TWSE, False for OTC.
         sid: Warrant code. If None, returns the entire day for all warrants.
         lazy: If True, return a polars LazyFrame; otherwise collect and return pandas DataFrame.
+        format_match_time: If True, rewrite match_time to "HH:MM:SS.ffffff". Pass False to
+            keep the on-disk Int64 (HHMMSSffffff), which a filter can push down to the
+            parquet row-group statistics; the formatted column is computed, so a predicate
+            on it forces a full scan.
 
     Returns:
-        pandas DataFrame or polars LazyFrame with match_time formatted as HH:MM:SS.mmm.
+        pandas DataFrame or polars LazyFrame. match_time is formatted as HH:MM:SS.ffffff
+        unless format_match_time is False, in which case it stays the raw Int64.
     """
     base = _order_book_base_path()
     day_plain = day.replace("-", "")
@@ -132,7 +152,8 @@ def get_order_book_warrant(
     df_lazy = pl.scan_parquet(str(path))
     if sid is not None:
         df_lazy = df_lazy.filter(pl.col("stock_code") == sid)
-    df_lazy = _format_match_time(df_lazy)
+    if format_match_time:
+        df_lazy = _format_match_time(df_lazy)
 
     if lazy:
         return df_lazy
