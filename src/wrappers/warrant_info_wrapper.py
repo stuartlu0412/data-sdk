@@ -96,9 +96,19 @@ class WarrantInfoWrapper:
         (MOPS + TEJ, point-in-time) instead of FinMind — strike/ratio are real
         (get_warrant_summary()'s are 0), expiry stays current, no token needed.
 
-        Known columns:
+        Every column of warrant_history.parquet is returned as-is:
           warrant_id        (str)   recycling suffix stripped; not unique alone
           warrant_name      (str)   pairs with warrant_id as the key
+          effective_date    (date)  when these terms took effect
+          sequence          (int)   tie-break for two events on one date
+          strike            (float)
+          ratio             (float) shares per warrant unit
+          event_type        (str)   issuance | change | expiry_change | adjustment | reset | snapshot_diff
+          source            (str)   tej | mops_strike | mops_announcement | mops_snapshot | dim_synthesised
+          source_rank       (int)   precedence used to resolve same-moment rows
+          exercise_end_date (date)
+          cap / floor       (float) bull/bear + extendable warrants only
+          last_trade_date   (date)
           issuer            (str)
           type              (str)   "認購" (call) | "認售" (put)
           target_stock_id   (str)   underlying stock code
@@ -106,13 +116,9 @@ class WarrantInfoWrapper:
           market            (str)   "twse" | "otc"
           list_date         (date)
           exercise_start_date (date)
-          exercise_end_date   (date)
-          last_trade_date     (date)
-          strike            (float)
-          ratio             (float) shares per warrant unit
-          cap / floor       (float) bull/bear + extendable warrants only
           original_strike   (float) strike at issuance, pre-reset
           is_bull_bear      (bool)  牛證/熊證 flag
+          is_current        (bool)  last row of the warrant
 
         as_of=None: current terms. as_of="YYYY-MM-DD": terms as known then; no
         row means not yet listed or already expired.
@@ -147,23 +153,4 @@ class WarrantInfoWrapper:
                 ["warrant_id", "warrant_name", "effective_date", "sequence"]
             ).drop_duplicates(subset=["warrant_id", "warrant_name"], keep="last")
 
-        columns = [
-            "warrant_id",
-            "warrant_name",
-            "issuer",
-            "type",
-            "target_stock_id",
-            "target_name",
-            "market",
-            "list_date",
-            "exercise_start_date",
-            "exercise_end_date",
-            "last_trade_date",
-            "strike",
-            "ratio",
-            "cap",
-            "floor",
-            "original_strike",
-            "is_bull_bear",
-        ]
-        return summary[columns].reset_index(drop=True)
+        return summary.reset_index(drop=True)
