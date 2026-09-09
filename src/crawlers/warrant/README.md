@@ -93,6 +93,7 @@ effective_date, sequence)`.
 | `exercise_start_date` | datetime | 0 | 履約開始日。美式等於 `list_date`，歐式等於 `exercise_end_date` |
 | `original_strike` | float | 0 | 發行時履約價，**重設前**的值。重設型權證不能拿來當可交易的履約價，要用 `strike` |
 | `is_bull_bear` | bool | 0 | 牛證/熊證標記，746 檔。研究時排除 |
+| `is_american` | bool | 0 | 美式（上市日起可履約）vs 歐式（只能到期日履約）。**沒有任何來源對全母體標示這件事**（`t90sb01` 無此欄、交易所 OpenAPI 也沒有、TEJ 的 `權證類型` 與 `t95sb02` 的 `exercise_method` 只涵蓋部分），所以由日期推導：`exercise_start_date == list_date`。對 TEJ 有涵蓋的 418,527 檔驗證 100% 吻合、零例外 |
 
 `warrant_basic_info.parquet`（dim 表）是一檔一列的現況表，靜態欄相同，另有現行的
 `latest_strike` / `alloc_qty_per_1k` / `exercise_end_date`，以及三個來源標記

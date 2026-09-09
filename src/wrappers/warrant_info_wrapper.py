@@ -118,6 +118,8 @@ class WarrantInfoWrapper:
           exercise_start_date (date)
           original_strike   (float) strike at issuance, pre-reset
           is_bull_bear      (bool)  牛證/熊證 flag
+          is_american       (bool)  exercisable from listing, not only at
+                                     maturity; derived from the dates
           is_current        (bool)  last row of the warrant
 
         as_of=None: current terms. as_of="YYYY-MM-DD": terms as known then; no

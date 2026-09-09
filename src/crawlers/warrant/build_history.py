@@ -72,6 +72,7 @@ STATIC_COLUMNS = [
     'exercise_start_date',
     'original_strike',
     'is_bull_bear',
+    'is_american',
 ]
 EVENT_COLUMNS = WARRANT_KEY + ['effective_date', 'sequence'] + STATE_COLUMNS + [
     'event_type',

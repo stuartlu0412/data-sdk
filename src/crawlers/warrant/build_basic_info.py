@@ -197,6 +197,14 @@ def build_dim_warrant(cache_directory: Path) -> pd.DataFrame:
     # Bull/bear certificates (牛證/熊證) behave differently and TEJ never covers
     # them, so downstream studies exclude them -- flag rather than drop.
     basic['is_bull_bear'] = basic['warrant_name'].str.contains('牛|熊', regex=True, na=False)
+
+    # Exercise style, which no source states for the whole population: t90sb01
+    # has no such column, the exchange OpenAPI has none either, and TEJ's
+    # 權證類型 / t95sb02's exercise_method only cover part of the universe. It is
+    # implied by the dates instead -- an American warrant can be exercised from
+    # its first trading day, a European one only at maturity. Checked against
+    # TEJ's 權證類型 on all 418,527 warrants both sources share: no exceptions.
+    basic['is_american'] = basic['exercise_start_date'] == basic['list_date']
     return basic
 
 
