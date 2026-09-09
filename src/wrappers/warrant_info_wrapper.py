@@ -114,16 +114,18 @@ class WarrantInfoWrapper:
           target_stock_id   (str)   underlying stock code
           target_name       (str)   underlying stock name
           market            (str)   "twse" | "otc"
-          list_date         (date)
-          exercise_start_date (date)
+          list_date         (date)  null when MOPS corrupted it and neither
+                                     TEJ nor FinMind could repair it
+          exercise_start_date (date) same
           original_strike   (float) strike at issuance, pre-reset
           is_bull_bear      (bool)  牛證/熊證 flag
           is_american       (bool)  exercisable from listing, not only at
-                                     maturity; derived from the dates
+                                     maturity; derived from the dates, null
+                                     when list_date is
           is_current        (bool)  last row of the warrant
 
         as_of=None: current terms. as_of="YYYY-MM-DD": terms as known then; no
-        row means not yet listed or already expired.
+        row means not yet listed, already expired, or list_date unknown.
 
         Reads <cache_dir>/warrant_history.parquet (default
         $DATA_SDK_WARRANT_CACHE_PATH). Refresh with

@@ -8,15 +8,18 @@ Three sources, in precedence order per field:
 
 1. ``mops_raw/warrant_basic_info`` -- the base population and every issuance-time
    field (``original_strike``, ``issuer``, ``target_stock_id``, ...).
-2. ``mops_raw/warrant_active_snapshot`` -- overwrites the *mutable* term fields
-   (``exercise_end_date``, ``last_trade_date``, ``latest_*``). The basic-info
-   resource is incremental on ``list_date``, so a warrant already past the
-   cursor is never re-read and its mutable fields freeze at first-crawl values;
-   an early termination or extension silently rots them. The snapshot has no
-   cursor and is replaced whole every run, so it always reflects MOPS today.
+2. ``mops_raw/warrant_active_snapshot`` -- supplies every live warrant (the
+   basic-info resource records a warrant only once it has expired) and
+   overwrites the *mutable* term fields (``exercise_end_date``,
+   ``last_trade_date``, ``latest_*``) of anything it covers. The snapshot has
+   no cursor and is replaced whole every run, so it always reflects MOPS today.
 3. the TEJ Pro export (``$DATA_SDK_TEJ_WARRANTS_PATH``) -- repairs ``list_date`` /
-   ``exercise_start_date``, which MOPS itself serves corrupted (~19,889 rows all
-   set to the literal 2023-12-26; confirmed by live-replaying the MOPS query).
+   ``exercise_start_date``, which MOPS itself serves corrupted (~51,500 rows,
+   nearly all OTC warrants expired 2011-2019, with both set to the literal
+   2023-12-26; confirmed by live-replaying the MOPS query).
+4. a frozen FinMind warrant summary (``$DATA_SDK_FINMIND_WARRANTS_PATH``) --
+   the same repair for the ~48,700 corrupted rows that predate TEJ's window.
+   What neither covers is left null rather than wrong.
 
 The key is ``(warrant_id, warrant_name)`` with ``warrant_id`` stripped of its
 recycling suffix. It is what joins to TEJ too: ``exercise_end_date`` shifts on
@@ -36,16 +39,22 @@ import pandas as pd
 
 from . import (
     DEFAULT_CACHE_PATH,
+    FINMIND_SUMMARY_GLOB,
     TEJ_BASIC_INFO_GLOB,
     cache_directory as cache_dir,
+    find_finmind_seed,
     find_tej_seed,
 )
 
-#: Primary key. ``warrant_id`` is the 6-character listing code with any
-#: recycling suffix stripped; it is NOT unique on its own (MOPS reuses a code
+#: Primary key. ``warrant_id`` is the listing code (6 characters; 4 digits
+#: before 2005) with any recycling suffix stripped; it is NOT unique on its own (MOPS reuses a code
 #: once the previous warrant expires -- ``030001`` has been three different
 #: warrants), so the name is part of the key.
 WARRANT_KEY = ['warrant_id', 'warrant_name']
+
+#: The literal date MOPS serves in place of the real list_date /
+#: exercise_start_date on its corrupted rows.
+CORRUPTED_MOPS_DATE = pd.Timestamp('2023-12-26')
 
 DATE_COLUMNS = [
     'list_date',
@@ -73,6 +82,8 @@ def load_raw_table(cache_directory: Path, table_name: str) -> pd.DataFrame | Non
         return None
     frame = pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
     frame = frame.drop(columns=[column for column in frame.columns if column.startswith('_dlt_')])
+    # Crawls before 2026-09 stored a blank cell as the text 'nan'.
+    frame = frame.replace({'nan': None})
     for column in frame.columns:
         if column.endswith('_date'):
             frame[column] = pd.to_datetime(frame[column])
@@ -82,13 +93,14 @@ def load_raw_table(cache_directory: Path, table_name: str) -> pd.DataFrame | Non
 def add_warrant_key(frame: pd.DataFrame, id_column: str, name_column: str) -> pd.DataFrame:
     """Normalise the identity columns to ``(warrant_id, warrant_name)``.
 
-    The 7th character of a MOPS code is a recycling suffix, not part of the
-    traded code, and each vendor assigns its own (MOPS ``703055b`` vs TEJ
-    ``703055Y``), so it is stripped. Codes below 7 characters already end at
-    the traded code (``03001T``) and are untouched.
+    A letter after the traded code is a recycling suffix, not part of it, and
+    each vendor assigns its own (MOPS ``703055b`` vs TEJ ``703055Y``), so it
+    is stripped. Traded codes are 6 characters from 2005 on and 4 digits
+    before (``0680a`` -> ``0680``); a 6-character code ending in a letter
+    (``03001T``) is complete and untouched.
     """
     out = frame.copy()
-    out['warrant_id'] = out[id_column].str[:6]
+    out['warrant_id'] = out[id_column].str.replace(r'^(\d{4}|\w{6})[A-Za-z]$', r'\1', regex=True)
     if name_column != 'warrant_name':
         out['warrant_name'] = out[name_column]
     return out
@@ -169,11 +181,75 @@ def impute_dates_from_tej(basic: pd.DataFrame, tej_basic: pd.DataFrame) -> pd.Da
     return out.drop(columns=['tej_list_date', 'tej_exercise_start_date'])
 
 
+def impute_dates_from_finmind(basic: pd.DataFrame, finmind: pd.DataFrame) -> pd.DataFrame:
+    """Second repair pass for ``list_date``, for warrants TEJ does not cover.
+
+    The corrupted MOPS rows are almost all OTC warrants that expired before
+    2020 (48,739 of the 51,537 are OTC), and TEJ's export starts in 2019.
+    FinMind's warrant summary lists them from 2011 with a listing date. Rows
+    are matched on the code plus the last trading day -- FinMind's
+    ``end_date`` is the last trading day on TWSE rows but the expiry on OTC
+    rows, so both are tried. On the 19,687 warrants all three sources share,
+    FinMind agrees with TEJ to the day 97.7% of the time and within 3 days
+    99.9%, so it ranks below TEJ and is only applied where the MOPS date is
+    still visibly wrong (after the last trading day).
+
+    Whatever stays unrepaired is nulled afterwards (:func:`null_unrepaired_dates`);
+    downstream as-of logic treats null as "not yet listed".
+    """
+    finmind = finmind[['stock_id', 'date', 'end_date']].rename(
+        columns={'stock_id': 'warrant_id', 'date': 'finmind_list_date', 'end_date': 'finmind_end_date'}
+    )
+    finmind['finmind_list_date'] = pd.to_datetime(finmind['finmind_list_date'])
+    finmind['finmind_end_date'] = pd.to_datetime(finmind['finmind_end_date'])
+    finmind = finmind.drop_duplicates(subset=['warrant_id', 'finmind_end_date'], keep='first')
+
+    out = basic.reset_index(drop=True)
+    by_last_trade = out[['warrant_id', 'last_trade_date']].merge(
+        finmind, left_on=['warrant_id', 'last_trade_date'], right_on=['warrant_id', 'finmind_end_date'], how='left'
+    )['finmind_list_date']
+    by_expiry = out[['warrant_id', 'exercise_end_date']].merge(
+        finmind, left_on=['warrant_id', 'exercise_end_date'], right_on=['warrant_id', 'finmind_end_date'], how='left'
+    )['finmind_list_date']
+    finmind_list_date = by_last_trade.fillna(by_expiry)
+
+    is_corrupted = out['list_date'] > out['last_trade_date']
+    repairable = is_corrupted & finmind_list_date.notna()
+    out.loc[repairable, 'list_date'] = finmind_list_date[repairable]
+    out.loc[repairable, 'list_date_source'] = 'finmind_imputed'
+    # MOPS corrupts exercise_start_date alongside list_date, and only on
+    # American warrants (a European one's start is its expiry, which is
+    # intact), so the repaired listing date is its start as well.
+    start_corrupted = repairable & (out['exercise_start_date'] == CORRUPTED_MOPS_DATE)
+    out.loc[start_corrupted, 'exercise_start_date'] = finmind_list_date[start_corrupted]
+    out.loc[start_corrupted, 'exercise_start_date_source'] = 'finmind_imputed'
+
+    print(f'imputed list_date from FinMind: {int(repairable.sum()):,} rows')
+    print(f'imputed exercise_start_date from FinMind: {int(start_corrupted.sum()):,} rows')
+    return out
+
+
+def null_unrepaired_dates(basic: pd.DataFrame) -> pd.DataFrame:
+    """A listing date after the last trading day is not a date; null it."""
+    out = basic.copy()
+    unrepaired = out['list_date'] > out['last_trade_date']
+    out.loc[unrepaired, ['list_date', 'list_date_source']] = [pd.NaT, 'unknown']
+    unrepaired_start = unrepaired & (out['exercise_start_date'] == CORRUPTED_MOPS_DATE)
+    out.loc[unrepaired_start, ['exercise_start_date', 'exercise_start_date_source']] = [pd.NaT, 'unknown']
+    print(f'list_date still unrepaired (nulled): {int(unrepaired.sum()):,} rows')
+    return out
+
+
 def build_dim_warrant(cache_directory: Path) -> pd.DataFrame:
     basic = load_raw_table(cache_directory, 'warrant_basic_info')
     if basic is None:
         raise FileNotFoundError(f'no warrant_basic_info under {cache_directory}/mops_raw')
+    # Append-only table: a re-swept 到期日 window (e.g. the cursor's own year,
+    # or a backfill) lands the same expired rows a second time.
     basic = add_warrant_key(basic, 'warrant_id', 'warrant_name')
+    # A warrant whose expiry moved between sweeps (early termination) appears
+    # under two exercise_end_dates; the later sweep has the final one.
+    basic = basic.drop_duplicates(subset=WARRANT_KEY, keep='last')
     print(f'MOPS basic_info: {len(basic):,} rows')
 
     snapshot = load_raw_table(cache_directory, 'warrant_active_snapshot')
@@ -194,6 +270,14 @@ def build_dim_warrant(cache_directory: Path) -> pd.DataFrame:
         basic['list_date_source'] = 'mops'
         basic['exercise_start_date_source'] = 'mops'
 
+    finmind_path = find_finmind_seed()
+    if finmind_path is not None:
+        print(f'FinMind seed: {finmind_path}')
+        basic = impute_dates_from_finmind(basic, pd.read_parquet(finmind_path))
+    else:
+        print(f'WARNING: no {FINMIND_SUMMARY_GLOB} in the FinMind seed dir -- pre-2019 list_date repair skipped')
+    basic = null_unrepaired_dates(basic)
+
     # Bull/bear certificates (牛證/熊證) behave differently and TEJ never covers
     # them, so downstream studies exclude them -- flag rather than drop.
     basic['is_bull_bear'] = basic['warrant_name'].str.contains('牛|熊', regex=True, na=False)
@@ -204,7 +288,9 @@ def build_dim_warrant(cache_directory: Path) -> pd.DataFrame:
     # implied by the dates instead -- an American warrant can be exercised from
     # its first trading day, a European one only at maturity. Checked against
     # TEJ's 權證類型 on all 418,527 warrants both sources share: no exceptions.
-    basic['is_american'] = basic['exercise_start_date'] == basic['list_date']
+    # Nullable: unknown where either date could not be repaired.
+    both_dates_known = basic['exercise_start_date'].notna() & basic['list_date'].notna()
+    basic['is_american'] = (basic['exercise_start_date'] == basic['list_date']).where(both_dates_known).astype('boolean')
     return basic
 
 

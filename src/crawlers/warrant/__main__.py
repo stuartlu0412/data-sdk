@@ -30,7 +30,8 @@ def main() -> None:
     parser.add_argument('--cache-dir', default=None,
                         help=f'writes mops_raw/ and mops_pipeline_state/ under this'
                              f' (default: $DATA_SDK_WARRANT_CACHE_PATH or {DEFAULT_CACHE_PATH})')
-    parser.add_argument('--history-start-year', type=int, default=HISTORY_START_YEAR, help='earliest year to sweep for delisted warrants')
+    parser.add_argument('--history-start-year', type=int, default=HISTORY_START_YEAR, help='earliest 到期日 year to sweep for delisted warrants')
+    parser.add_argument('--history-end-year', type=int, default=None, help='last 到期日 year to sweep (default: this year); use to backfill in chunks')
     parser.add_argument('--resources', nargs='+', choices=RESOURCE_NAMES, default=None, help='restrict the run to these resources (default: all three)')
     arguments = parser.parse_args()
 
@@ -43,7 +44,7 @@ def main() -> None:
         dataset_name='mops_raw',
         pipelines_dir=str(cache_directory / 'mops_pipeline_state'),
     )
-    source = warrant_reports_source(arguments.history_start_year)
+    source = warrant_reports_source(arguments.history_start_year, arguments.history_end_year)
     if arguments.resources is not None:
         source = source.with_resources(*arguments.resources)
     print(pipeline.run(source, loader_file_format='parquet'))

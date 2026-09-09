@@ -236,12 +236,25 @@ def scheduled_expiry_dates(cache_directory: Path, dim_warrant: pd.DataFrame) -> 
     tej = add_warrant_key(tej, '權證代號', '權證名')
     tej = tej.drop_duplicates(subset=WARRANT_KEY, keep='first')
 
+    # 預定最後交易日 is not reliable to the day: on ~6,800 warrants it sits 1-7
+    # days off the actual last trading day with no termination involved (the
+    # shifts cluster on market closures -- 2025-10-22, 2026-02-10 -- and TEJ's
+    # own schedule arithmetic), and taking it literally put 0.9% of live
+    # warrants one day off the exchange's expiry. A real early termination
+    # moves the date by weeks, and those cluster per underlying event (the 35
+    # warrants all ending 2026-08-20 on a 2026-09-11 schedule), so only a
+    # shift beyond a week is treated as a reschedule; otherwise the actual
+    # dates are the schedule.
+    # ponytail: 7-day cut-off; use the announcement table to classify if a
+    # termination inside a week ever matters.
     settlement_gap = tej['到期日'] - tej['最後交易日']
+    is_rescheduled = (tej['最後交易日'] - tej['預定最後交易日']).dt.days < -7
+    scheduled_last_trade_date = tej['預定最後交易日'].where(is_rescheduled, tej['最後交易日'])
     scheduled = pd.DataFrame({
         'warrant_id': tej['warrant_id'],
         'warrant_name': tej['warrant_name'],
-        'tej_scheduled_last_trade_date': tej['預定最後交易日'],
-        'tej_scheduled_exercise_end_date': tej['預定最後交易日'] + settlement_gap,
+        'tej_scheduled_last_trade_date': scheduled_last_trade_date,
+        'tej_scheduled_exercise_end_date': scheduled_last_trade_date + settlement_gap,
     })
 
     out = fallback.merge(scheduled, on=WARRANT_KEY, how='left')
@@ -352,8 +365,16 @@ def chain_events(
     dim_warrant: pd.DataFrame,
     scheduled_expiry: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Order, de-duplicate and forward-fill events into point-in-time rows."""
-    events = events.dropna(subset=WARRANT_KEY + ['effective_date'])
+    """Order, de-duplicate and forward-fill events into point-in-time rows.
+
+    An undated event is kept only when it is a synthesised issuance -- the
+    warrant's list_date is unknown (see build_basic_info), so its single row
+    is undated too. It still gives the warrant its current terms; an as-of
+    lookup never matches it, which is the right answer for "listed when?".
+    """
+    is_dated = events['effective_date'].notna()
+    is_undated_issuance = ~is_dated & (events['source'] == 'dim_synthesised')
+    events = events[is_dated | is_undated_issuance].dropna(subset=WARRANT_KEY)
     known_warrants = set(zip(dim_warrant['warrant_id'], dim_warrant['warrant_name']))
     is_known = [key in known_warrants for key in zip(events['warrant_id'], events['warrant_name'])]
     events = events[pd.Series(is_known, index=events.index)]
@@ -373,8 +394,11 @@ def chain_events(
     #   2. The same event reaches us from two sources near the seed boundary;
     #      the lower source_rank (TEJ, then announcements, then MOPS) wins.
     events['is_issuance'] = events['event_type'] == 'issuance'
+    # na_position: an issuance whose list_date is unknown (see
+    # build_basic_info) is undated and must still open the chain.
     events = events.sort_values(
         WARRANT_KEY + ['effective_date', 'sequence', 'is_issuance', 'source_rank'],
+        na_position='first',
     )
     events = events.drop_duplicates(
         subset=WARRANT_KEY + ['effective_date', 'sequence'], keep='first'

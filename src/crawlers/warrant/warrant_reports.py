@@ -2,7 +2,7 @@
 
 | Report | MOPS page | dlt resource | Incremental cursor |
 |---|---|---|---|
-| 權證基本資料彙總表 | ``t90sb01`` | ``warrant_basic_info`` | ``list_date`` |
+| 權證基本資料彙總表 | ``t90sb01`` | ``warrant_basic_info`` | ``exercise_end_date`` |
 | 履約價格及行使比例調整公告彙總表 | ``t95sb02`` | ``warrant_strike_ratio_adjustment`` | ``adjustment_effective_date`` |
 | 履約價格／履約點數重設公告彙總表 | ``t95sb03`` | ``warrant_strike_ratio_reset`` | ``reset_effective_date`` |
 
@@ -140,15 +140,16 @@ def dataframe_to_records(
     ``date_columns``/``numeric_columns`` may name columns absent from ``frame``
     (the uncapped 表二 section has no cap/floor columns); those are skipped.
     """
-    def clean_text(raw_value: object) -> str:
-        return str(raw_value).replace('\xa0', ' ').strip()
+    def clean_text(raw_value: object) -> str | None:
+        text = str(raw_value).replace('\xa0', ' ').strip()
+        return None if text.lower() in BLANK_CELL_TOKENS else text
 
     def clean_number(raw_value: object) -> float:
-        text = clean_text(raw_value).replace(',', '')
-        if text.lower() in BLANK_CELL_TOKENS:
+        text = clean_text(raw_value)
+        if text is None:
             return math.nan
         try:
-            return float(text)
+            return float(text.replace(',', ''))
         except ValueError:
             return math.nan
 
@@ -292,7 +293,9 @@ def crawl_basic_info_market(
         frame = frame.iloc[:, : len(BASIC_INFO_COLUMNS)]
         frame.columns = BASIC_INFO_COLUMNS
         # Drop stray non-data rows (e.g. a repeated header) lacking a real id.
-        frame = frame[frame['warrant_id'].str.match(r'^\w{6,}$', na=False)].reset_index(drop=True)
+        # Codes are 6 characters (+ recycling suffix) from 2005 on; before that
+        # they were 4 digits (``0680a``), so the floor is 4, not 6.
+        frame = frame[frame['warrant_id'].str.match(r'^\w{4,}$', na=False)].reset_index(drop=True)
         if frame.empty:
             break
         page_warrant_ids = set(frame['warrant_id'])
@@ -315,15 +318,33 @@ def crawl_basic_info_market(
 def warrant_basic_info_resource(
     session: requests.Session,
     history_start_year: int = HISTORY_START_YEAR,
+    history_end_year: int | None = None,
     request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS,
-    list_date=dlt.sources.incremental('list_date', initial_value=EARLIEST_CURSOR_DATE),
+    exercise_end_date=dlt.sources.incremental('exercise_end_date', initial_value=EARLIEST_CURSOR_DATE),
 ):
+    """Expired/delisted warrants only: the rc=0 view returns 到期日 <= today,
+    swept one 到期日 year-window at a time to keep each result set pageable.
+
+    The cursor is ``exercise_end_date`` because that is what the sweep is keyed
+    on: an expired warrant's row is immutable, so once a 到期日 window has
+    been read it never needs reading again, and the sweep resumes from the
+    cursor's year rather than ``history_start_year``. (An earlier cursor on
+    ``list_date`` made a backfill of older windows impossible -- every old
+    row was filtered out as "already seen".) Live warrants are not yielded
+    here; they come from :func:`warrant_active_snapshot_resource`, and
+    ``build_basic_info`` adopts the ones this table has not recorded yet.
+
+    ``history_end_year`` caps the sweep so a multi-decade backfill can be run
+    in chunks: MOPS drops the connection after ~30 minutes of paging, and dlt
+    discards the whole package when extraction fails, so one run per few
+    years is what actually lands. The cursor carries over between runs.
+    """
     today = datetime.date.today()
     frames: list[pd.DataFrame] = []
 
-    # (a) Expired/delisted warrants: the rc=0 view returns 到期日 <= today only,
-    # swept one 到期日 year-window at a time to keep each result set pageable.
-    for year in range(history_start_year, today.year + 1):
+    first_year = max(history_start_year, exercise_end_date.last_value.year)
+    last_year = min(history_end_year or today.year, today.year)
+    for year in range(first_year, last_year + 1):
         last_month = 12 if year < today.year else today.month
         window = {
             'rc': '0',
@@ -334,12 +355,6 @@ def warrant_basic_info_resource(
             frame = crawl_basic_info_market(session, market_code, window, request_delay_seconds)
             if frame is not None:
                 frames.append(frame.assign(market=market_name))
-
-    # (b) Still-active warrants: the unfiltered current snapshot.
-    for market_code, market_name in MARKET_CODES:
-        frame = crawl_basic_info_market(session, market_code, {}, request_delay_seconds)
-        if frame is not None:
-            frames.append(frame.assign(market=market_name))
 
     if not frames:
         return
@@ -365,12 +380,13 @@ def warrant_active_snapshot_resource(
 ):
     """t90sb01 current view, whole table replaced every run.
 
-    :func:`warrant_basic_info_resource` is incremental on ``list_date``, so a
-    warrant already past the cursor never gets re-read — its ``exercise_end_date``,
-    ``last_trade_date`` and ``latest_*`` stay frozen at whatever the first crawl
-    saw, which goes stale the moment a warrant is terminated early or extended.
-    This resource has no cursor and replaces its whole table, so every run
-    re-reads the current terms of every live warrant.
+    :func:`warrant_basic_info_resource` records expired warrants only, and
+    never re-reads one. This resource has no cursor and replaces its whole
+    table, so every run re-reads the current terms of every live warrant: it
+    is the only place a live warrant's ``exercise_end_date``,
+    ``last_trade_date`` and ``latest_*`` are kept fresh after an early
+    termination, extension or adjustment, and the only source of a listing
+    until it expires and the delisted sweep picks it up.
     """
     today = datetime.date.today()
     frames: list[pd.DataFrame] = []
@@ -749,11 +765,12 @@ def warrant_announcement_resource(
 @dlt.source(name='mops_warrant_reports')
 def warrant_reports_source(
     history_start_year: int = HISTORY_START_YEAR,
+    history_end_year: int | None = None,
     request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS,
 ):
     session = create_cookie_primed_session()
     return [
-        warrant_basic_info_resource(session, history_start_year, request_delay_seconds),
+        warrant_basic_info_resource(session, history_start_year, history_end_year, request_delay_seconds),
         warrant_active_snapshot_resource(session, request_delay_seconds),
         strike_ratio_adjustment_resource(session, request_delay_seconds),
         strike_ratio_reset_resource(session, request_delay_seconds),

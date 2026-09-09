@@ -4,9 +4,11 @@
 #   bash update.sh [daily|full] [cache-dir]
 #
 #   daily (default) — snapshot, announcements, strike/ratio events. ~3 min.
-#   full            — the above plus warrant_basic_info's delisted sweep, which
-#                     re-queries every 到期日 year-window back to 2003 (~2,500
-#                     requests, 20-40 min). Run it weekly, not daily.
+#   full            — the above plus warrant_basic_info's delisted sweep. The
+#                     cursor is exercise_end_date, so it re-queries only the
+#                     到期日 year-windows from the cursor's year on (a handful
+#                     of requests); the first run on an empty state sweeps
+#                     back to 2003 (~30 min).
 #
 # Why full is still needed: a warrant that listed after the last full sweep
 # exists only in the snapshot, and the snapshot only carries live warrants.
@@ -40,7 +42,7 @@ case "$MODE" in
             --cache-dir "$CACHE_DIR" --resources "${DAILY_RESOURCES[@]}"
         ;;
     full)
-        echo "=== crawl: all resources (includes the 2003- delisted sweep) ==="
+        echo "=== crawl: all resources (includes the delisted sweep) ==="
         "$PYTHON" -m data_sdk.crawlers.warrant --cache-dir "$CACHE_DIR"
         ;;
     *)

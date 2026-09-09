@@ -37,6 +37,7 @@ def load_table(cache_directory: Path, table_name: str) -> pd.DataFrame:
     # diagonal concat: tolerate schema drift in tables written before column
     # type hints were added (see column_type_hints in warrant_reports.py).
     frame = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    frame = frame.replace({'nan': None})
     for column in frame.columns:
         if column.endswith('_date'):
             frame[column] = pd.to_datetime(frame[column])
@@ -57,9 +58,10 @@ def check_structure(basic_info, adjustment, reset) -> None:
         duplicates = int(frame.duplicated(subset=key).sum())
         report(f'{name}: no duplicate natural key {tuple(key)}', duplicates == 0, f'{duplicates:,} duplicates')
 
-    bad_type = set(basic_info['type'].unique()) - {'認購', '認售'}
+    # A few dozen pre-2005 rows have no type at all on MOPS; NaN is tolerated.
+    bad_type = set(basic_info['type'].dropna().unique()) - {'認購', '認售'}
     report('basic_info: type in {認購, 認售}', not bad_type, str(bad_type))
-    bad_id = int((~basic_info['warrant_id'].str.match(r'^\w{6,}$')).sum())
+    bad_id = int((~basic_info['warrant_id'].str.match(r'^\w{4,}$')).sum())
     report('basic_info: warrant_id well formed', bad_id == 0, f'{bad_id:,} malformed')
     for column in ('latest_strike', 'alloc_qty_per_1k'):
         non_positive = int((basic_info[column] <= 0).sum())
@@ -177,25 +179,34 @@ def check_curated_layer(cache_directory: Path) -> None:
            bool((current_row_counts == 1).all()),
            f'{int((current_row_counts != 1).sum()):,} warrants violate')
 
-    listed_before_expiry = history['effective_date'] <= history['exercise_end_date']
+    dated = history.dropna(subset=['effective_date'])
+    listed_before_expiry = dated['effective_date'] <= dated['exercise_end_date']
     report('effective_date <= exercise_end_date',
            bool(listed_before_expiry.all()),
-           f'{int((~listed_before_expiry).sum()):,} violations')
+           f'{int((~listed_before_expiry).sum()):,} violations'
+           f' ({len(history) - len(dated):,} rows undated: list_date unknown)')
 
-    tradable_before_expiry = history['last_trade_date'] <= history['exercise_end_date']
+    with_last_trade = history.dropna(subset=['last_trade_date'])
+    tradable_before_expiry = with_last_trade['last_trade_date'] <= with_last_trade['exercise_end_date']
     report('last_trade_date <= exercise_end_date',
            bool(tradable_before_expiry.all()),
-           f'{int((~tradable_before_expiry).sum()):,} violations')
+           f'{int((~tradable_before_expiry).sum()):,} violations'
+           f' ({len(history) - len(with_last_trade):,} rows without one: 2003-04 MOPS blanks)')
 
     current = history[history['is_current']].merge(
         dimension[WARRANT_KEY + ['latest_strike', 'alloc_qty_per_1k', 'exercise_end_date']],
         on=WARRANT_KEY,
         suffixes=('', '_dim'),
     )
+    # A warrant with no strike history at all (pre-2020 expiry, outside TEJ)
+    # carries only its issuance strike, so it cannot close against the final
+    # one; the check is over warrants that have some history.
+    has_history = current['source'] != 'dim_synthesised'
     strike_matches = (current['strike'] - current['latest_strike']).abs() <= 0.01
-    report('current strike == dim latest_strike (>=98%)',
-           float(strike_matches.mean()) >= 0.98,
-           f'{strike_matches.mean():.2%}')
+    report('current strike == dim latest_strike (>=98%, warrants with history)',
+           float(strike_matches[has_history].mean()) >= 0.98,
+           f'{strike_matches[has_history].mean():.2%} of {int(has_history.sum()):,};'
+           f' {int((~has_history).sum()):,} synthesised-only at {strike_matches[~has_history].mean():.2%}')
 
     ratio_matches = (current['ratio'] - current['alloc_qty_per_1k'] / 1000).abs() <= 1e-4
     report('current ratio == dim alloc_qty_per_1k/1000 (>=99%)',
@@ -210,7 +221,8 @@ def check_curated_layer(cache_directory: Path) -> None:
     corrupted_list_dates = dimension['list_date'] > dimension['last_trade_date']
     report('dim list_date <= last_trade_date (MOPS 2023-12-26 bug repaired)',
            not bool(corrupted_list_dates.any()),
-           f'{int(corrupted_list_dates.sum()):,} violations')
+           f'{int(corrupted_list_dates.sum()):,} violations;'
+           f' {int(dimension["list_date"].isna().sum()):,} unknown (null)')
 
 
 def main() -> None:
@@ -220,7 +232,11 @@ def main() -> None:
     arguments = parser.parse_args()
     cache_directory = cache_dir(arguments.cache_dir)
 
-    basic_info = load_table(cache_directory, 'warrant_basic_info')
+    # Same dedup as build_basic_info: re-swept 到期日 windows append the same
+    # expired rows again, which is expected, not a defect.
+    basic_info = load_table(cache_directory, 'warrant_basic_info').drop_duplicates(
+        subset=RAW_WARRANT_KEY, keep='last'
+    )
     adjustment = load_table(cache_directory, 'warrant_strike_ratio_adjustment')
     reset = load_table(cache_directory, 'warrant_strike_ratio_reset')
     print(f'basic_info {basic_info.shape[0]:,} rows | adjustment {adjustment.shape[0]:,} rows'

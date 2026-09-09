@@ -20,6 +20,13 @@ DEFAULT_TEJ_SEED_PATH = '/mnt/nfs/backup/tej_warrants'
 TEJ_BASIC_INFO_GLOB = 'tej_warrant_raw_*.parquet'
 TEJ_ADJUSTMENT_GLOB = 'tej_warrant_adjustment_*.parquet'
 
+#: Frozen FinMind ``TaiwanStockInfoWithWarrantSummary`` pulls (one row per
+#: warrant with its listing date), same treatment as the TEJ exports. Second
+#: source for repairing MOPS's corrupted ``list_date`` where TEJ has no row.
+DEFAULT_FINMIND_SEED_PATH = '/mnt/nfs/backup/finmind_warrants'
+
+FINMIND_SUMMARY_GLOB = 'warrant_summary_*.parquet'
+
 
 def cache_directory(override: str | Path | None = None) -> Path:
     if override is not None:
@@ -33,12 +40,25 @@ def tej_seed_directory(override: str | Path | None = None) -> Path:
     return Path(os.environ.get('DATA_SDK_TEJ_WARRANTS_PATH', DEFAULT_TEJ_SEED_PATH))
 
 
-def find_tej_seed(pattern: str, seed_directory: Path | None = None) -> Path | None:
-    """Newest export matching ``pattern``, or None.
+def finmind_seed_directory(override: str | Path | None = None) -> Path:
+    if override is not None:
+        return Path(override)
+    return Path(os.environ.get('DATA_SDK_FINMIND_WARRANTS_PATH', DEFAULT_FINMIND_SEED_PATH))
 
-    The exports are named with the range they cover
+
+def find_seed(pattern: str, directory: Path) -> Path | None:
+    """Newest file matching ``pattern`` in ``directory``, or None.
+
+    Seeds are named with the range or date they cover
     (``tej_warrant_raw_20191231-20260812.parquet``), so a fresh drop sorts last.
     """
-    directory = tej_seed_directory(seed_directory)
     matches = sorted(glob.glob(str(directory / pattern)))
     return Path(matches[-1]) if matches else None
+
+
+def find_tej_seed(pattern: str, seed_directory: Path | None = None) -> Path | None:
+    return find_seed(pattern, tej_seed_directory(seed_directory))
+
+
+def find_finmind_seed(pattern: str = FINMIND_SUMMARY_GLOB, seed_directory: Path | None = None) -> Path | None:
+    return find_seed(pattern, finmind_seed_directory(seed_directory))
