@@ -1,0 +1,18 @@
+# Warrant database refresh. Install with:  crontab -e
+#
+# Times are local (Asia/Taipei on this box). Taiwan warrants stop trading at
+# 13:30 and MOPS publishes the day's announcements through the afternoon, so
+# the daily run is after 18:00 to catch them.
+#
+# flock keeps a slow run from being overlapped by the next one: the full sweep
+# takes 20-40 min and both jobs write the same dlt cursors and parquet files.
+# -n means "skip this run if one is already going", not "queue behind it".
+
+DATA_SDK=/home/lu/research/data-sdk
+
+# Daily — snapshot, announcements, strike/ratio events, rebuild, validate. ~3 min.
+0 18 * * 1-5 flock -n /tmp/warrant-update.lock $DATA_SDK/src/crawlers/warrant/run_scheduled.sh daily >> /home/lu/logs/warrant-daily.log 2>&1
+
+# Weekly — adds warrant_basic_info's 2003- delisted sweep, which is what makes
+# recently-listed warrants durable once they expire. Sunday, off-hours.
+0 3 * * 0 flock -n /tmp/warrant-update.lock $DATA_SDK/src/crawlers/warrant/run_scheduled.sh full >> /home/lu/logs/warrant-weekly.log 2>&1

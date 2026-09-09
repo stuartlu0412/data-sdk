@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # Refresh the warrant database end to end.
 #
-#   bash update.sh [cache-dir]      # default: $DATA_SDK_WARRANT_CACHE_PATH
+#   bash update.sh [daily|full] [cache-dir]
+#
+#   daily (default) — snapshot, announcements, strike/ratio events. ~3 min.
+#   full            — the above plus warrant_basic_info's delisted sweep, which
+#                     re-queries every 到期日 year-window back to 2003 (~2,500
+#                     requests, 20-40 min). Run it weekly, not daily.
+#
+# Why full is still needed: a warrant that listed after the last full sweep
+# exists only in the snapshot, and the snapshot only carries live warrants.
+# Once it expires it drops out, and without the delisted sweep having recorded
+# it, it disappears from the database entirely.
 #
 # Crawl is incremental (dlt cursors under <cache-dir>/mops_pipeline_state);
 # the two curated tables are pure functions of the raw layer and are rebuilt
@@ -12,16 +22,37 @@
 # append-only copy is the only record of anything older.
 set -euo pipefail
 
-CACHE_DIR="${1:-${DATA_SDK_WARRANT_CACHE_PATH:-/mnt/nfs/backup/warrant_terms}}"
+MODE="${1:-daily}"
+CACHE_DIR="${2:-${DATA_SDK_WARRANT_CACHE_PATH:-/mnt/nfs/backup/warrant_history}}"
 PYTHON="${PYTHON:-python}"
 
-echo "=== crawl (incremental) ==="
-"$PYTHON" -m data_sdk.crawlers.warrant --cache-dir "$CACHE_DIR"
+DAILY_RESOURCES=(
+    warrant_active_snapshot
+    warrant_announcement
+    warrant_strike_ratio_adjustment
+    warrant_strike_ratio_reset
+)
+
+case "$MODE" in
+    daily)
+        echo "=== crawl: ${DAILY_RESOURCES[*]} ==="
+        "$PYTHON" -m data_sdk.crawlers.warrant \
+            --cache-dir "$CACHE_DIR" --resources "${DAILY_RESOURCES[@]}"
+        ;;
+    full)
+        echo "=== crawl: all resources (includes the 2003- delisted sweep) ==="
+        "$PYTHON" -m data_sdk.crawlers.warrant --cache-dir "$CACHE_DIR"
+        ;;
+    *)
+        echo "usage: update.sh [daily|full] [cache-dir]" >&2
+        exit 2
+        ;;
+esac
 
 echo "=== build dimension table ==="
 "$PYTHON" -m data_sdk.crawlers.warrant.build_basic_info --cache-dir "$CACHE_DIR"
 
-echo "=== build term history (SCD2) ==="
+echo "=== build history (SCD2) ==="
 "$PYTHON" -m data_sdk.crawlers.warrant.build_history --cache-dir "$CACHE_DIR"
 
 echo "=== validate (offline, internal consistency) ==="

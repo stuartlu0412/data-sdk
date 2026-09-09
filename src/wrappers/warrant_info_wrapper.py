@@ -28,7 +28,10 @@ class WarrantInfoWrapper:
         # doesn't touch FinMind at all, and shouldn't need FINMIND_API_TOKEN set
         # or a writable cache_dir just to construct the wrapper.
         self._api = None
-        self._cache_dir = cache_dir
+        # str is accepted as well as Path: the FinMind cache path is built with
+        # `/`, which a str would only fail on much later, inside
+        # get_warrant_summary().
+        self._cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._summary_cache: Optional[pd.DataFrame] = None
         self._names_cache: Optional[pd.DataFrame] = None
         self._history_cache: Optional[pd.DataFrame] = None
