@@ -31,6 +31,21 @@ df_warrant = get_order_book_warrant("2026-01-02", is_twse=True)
 df_w_sid   = get_order_book_warrant("2026-01-02", is_twse=True, sid="700339")
 ```
 
+`match_time` comes back as `"HH:MM:SS.ffffff"`. That column is computed, so a filter on it
+cannot reach the parquet's row-group statistics and forces a full scan. Pass
+`format_match_time=False` to keep the on-disk `Int64` (`HHMMSSffffff`) and let the predicate
+push down, which is what you want when scanning a whole day for a narrow time window.
+
+```python
+import polars as pl
+
+pre_open = (
+    get_order_book_stocks("2026-01-02", is_twse=True, lazy=True, format_match_time=False)
+    .filter(pl.col("match_time") < 90_000_000_000)
+    .collect()
+)
+```
+
 ## Installation
 
 1.  Clone the repository:
