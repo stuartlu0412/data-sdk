@@ -80,6 +80,10 @@ export DATA_SDK_SHIOAJI_FUTURES_TICKS_PATH="/mnt/nfs/backup/shioaji_futures_tick
 export DATA_SDK_ORDER_BOOK_PARQUET_PATH="/mnt/nfs/backup/parquets"
 export DATA_SDK_TEJ_CACHE_PATH="/mnt/nfs/backup/tej_cache"
 export DATA_SDK_FOP_PARQUET_PATH="/mnt/nfs/backup/fop_parquets"  # defaults to this path if unset
+# warrant crawler related paths
+export DATA_SDK_WARRANT_CACHE_PATH="/mnt/nfs/backup/warrant_history"
+export DATA_SDK_TEJ_WARRANTS_PATH="/mnt/nfs/backup/tej_warrants"
+export DATA_SDK_FINMIND_WARRANTS_PATH="/mnt/nfs/backup/finmind_warrants"
 ```
 
 ### API Keys
