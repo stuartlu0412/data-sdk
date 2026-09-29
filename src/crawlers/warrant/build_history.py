@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from . import (
@@ -487,6 +488,44 @@ def events_from_snapshot_diff(
     return diff_events
 
 
+def trading_days_before(dates: pd.Series, days: int) -> pd.Series:
+    """Each date moved back by ``days`` Taiwan trading days.
+
+    The calendar is FinMind's ``TaiwanStockTradingDate``, which the exchange
+    publishes for the whole year ahead -- plain business days miss the
+    holidays, and a termination expiring 2026-09-30 got 09-28 (教師節) as its
+    last trading day instead of 09-24, with 09-25 (中秋) between them. Dates
+    the calendar does not reach (next year's before it is published) and any
+    failure to fetch it fall back to business days.
+    """
+    business_days = dates - days * pd.offsets.BDay()
+    if dates.empty:
+        return business_days
+    try:
+        from data_sdk.wrappers.finmind_broker_wrapper import FinMindWrapper
+        trading_dates = FinMindWrapper().get_trading_dates(
+            (dates.min() - pd.Timedelta(days=30)).strftime('%Y-%m-%d'),
+            dates.max().strftime('%Y-%m-%d'),
+        )
+        calendar = np.sort(pd.to_datetime(trading_dates['date']).to_numpy())
+    except Exception as error:
+        print(f'WARNING: no trading calendar ({error}); last trading days use business days')
+        return business_days
+    if len(calendar) == 0:
+        print('WARNING: empty trading calendar; last trading days use business days')
+        return business_days
+
+    positions = np.searchsorted(calendar, dates.to_numpy(), side='left')
+    is_covered = (dates.to_numpy() <= calendar[-1]) & (positions >= days)
+    shifted = calendar[np.clip(positions - days, 0, None)]
+    covered_dates = pd.Series(shifted, index=dates.index)
+    is_covered_series = pd.Series(is_covered, index=dates.index)
+    uncovered_count = int((~is_covered_series).sum())
+    if uncovered_count:
+        print(f'{uncovered_count:,} dates beyond the trading calendar use business days')
+    return covered_dates.where(is_covered_series, business_days)
+
+
 def chain_events(
     events: pd.DataFrame,
     dim_warrant: pd.DataFrame,
@@ -553,14 +592,34 @@ def chain_events(
         events[column] = grouped[column].ffill()
 
     # An expiry_change carries only the new expiry, so its last_trade_date was
-    # forward-filled from before the change and can now sit after expiry. An
-    # early termination's last trading day is two business days before the new
-    # expiry (every one of the 60 checked against the exchange), so re-derive
-    # it that way; the calendar gap taken at issuance spans weekends and was
-    # off by one or two days on most of them.
+    # forward-filled from before the change and can now sit after expiry. MOPS
+    # publishes the new last trading day with the termination (the dimension
+    # table holds it), so that is taken where the dimension's expiry is the
+    # same one. Otherwise it is two trading days before the new expiry (every
+    # one of the 60 checked against the exchange). Where both exist they are
+    # compared, as a check on the calendar rule.
     last_trade_date_is_stale = events['last_trade_date'] > events['exercise_end_date']
-    events.loc[last_trade_date_is_stale, 'last_trade_date'] = (
-        events.loc[last_trade_date_is_stale, 'exercise_end_date'] - 2 * pd.offsets.BDay()
+    stale = events.loc[last_trade_date_is_stale, WARRANT_KEY + ['exercise_end_date']]
+    published = stale.merge(
+        dim_warrant[WARRANT_KEY + ['exercise_end_date', 'last_trade_date']].rename(
+            columns={
+                'exercise_end_date': 'published_exercise_end_date',
+                'last_trade_date': 'published_last_trade_date',
+            }
+        ),
+        on=WARRANT_KEY,
+        how='left',
+    ).set_axis(stale.index)
+    expiry_is_published = published['exercise_end_date'] == published['published_exercise_end_date']
+    published_last_trade_date = published['published_last_trade_date'].where(expiry_is_published)
+    derived_last_trade_date = trading_days_before(stale['exercise_end_date'], days=2)
+    both_known = published_last_trade_date.notna()
+    disagree = both_known & (published_last_trade_date != derived_last_trade_date)
+    print(f'last trading day after an expiry change: {int(both_known.sum()):,} from MOPS,'
+          f' {int((~both_known).sum()):,} derived; {int(disagree.sum()):,} where MOPS and'
+          ' the calendar rule disagree')
+    events.loc[last_trade_date_is_stale, 'last_trade_date'] = published_last_trade_date.fillna(
+        derived_last_trade_date
     )
 
     # A handful of TEJ rows are dated a day or two after the warrant expired.
